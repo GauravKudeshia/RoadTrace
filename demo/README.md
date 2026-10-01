@@ -1,6 +1,6 @@
 # Reading the RoadTrace demo
 
-This folder contains a saved run from October 1, 2026. Start with [the annotated video](traffic-demo.mp4), then use [the CSV](vehicle_data.csv) to follow an individual track frame by frame.
+This folder contains a saved run from October 1, 2026. Start with [the annotated video](https://github.com/GauravKudeshia/RoadTrace/raw/refs/heads/main/demo/traffic-demo.mp4), then use [the CSV](vehicle_data.csv) to follow an individual track frame by frame.
 
 The video is the first eight seconds of the supplied traffic sample, processed at 960 × 540 and 25 FPS. It has been encoded as H.264 for playback in common browsers and video players. The animated preview uses a lower resolution and fewer frames; the full video retains all 200 frames and the original timing.
 
@@ -16,7 +16,7 @@ Some boxes or classes are imperfect. IDs may disappear or change through occlusi
 
 | File | Contents |
 | --- | --- |
-| [traffic-demo.mp4](traffic-demo.mp4) | Full eight-second annotated video |
+| [traffic-demo.mp4](https://github.com/GauravKudeshia/RoadTrace/raw/refs/heads/main/demo/traffic-demo.mp4) | Full eight-second annotated video |
 | [traffic-preview.gif](traffic-preview.gif) | Animated README preview |
 | [preview.jpg](preview.jpg) | Still frame from the same run |
 | [vehicle_data.csv](vehicle_data.csv) | Frame-level positions and estimated mph |

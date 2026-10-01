@@ -8,9 +8,9 @@ RoadTrace follows vehicles through a fixed-camera road video and turns their mov
 
 The eight-second clip below is an actual output from the project. It shows tracked vehicle IDs, their recent paths, and speed estimates in both directions of travel. You can watch it before setting anything up.
 
-[![RoadTrace demo: vehicle tracks and estimated speeds in mph](demo/traffic-preview.gif)](demo/traffic-demo.mp4)
+[![RoadTrace demo: vehicle tracks and estimated speeds in mph](demo/traffic-preview.gif)](https://github.com/GauravKudeshia/RoadTrace/raw/refs/heads/main/demo/traffic-demo.mp4)
 
-**[Watch or download the full demo](demo/traffic-demo.mp4)** · [View the measurements](demo/vehicle_data.csv) · [View the speed distribution](demo/speed_distribution.png)
+**[Download the full demo (MP4)](https://github.com/GauravKudeshia/RoadTrace/raw/refs/heads/main/demo/traffic-demo.mp4)** · [View the measurements](demo/vehicle_data.csv) · [View the speed distribution](demo/speed_distribution.png)
 
 The yellow outline marks the road area used for calibration. A vehicle needs about one second of usable tracking history before a speed appears. “Warming up,” “partial view,” and “beyond calibration” explain why some vehicles don't have a number yet.
 
