@@ -1,0 +1,1067 @@
+// Wires the camera/file source, detector, and tracker together, and draws
+// results on the overlay canvas. This file is UI glue, deliberately kept
+// thin so the logic it calls (postprocess.js, tracker.js) is the part
+// that's unit-tested.
+//
+// Renamed from app.js when camera.html replaced index.html as the live
+// camera tool (index.html became the marketing landing page) and the page
+// was restyled as a dark "HUD" to match a design mockup.
+//
+// Manual two-point calibration (speed.js's Calibration/SpeedEstimator, and
+// the tap-two-spots flow that used to live here) was removed from this page
+// entirely, per direct feedback that it was confusing and out of place for
+// a point-your-phone-at-traffic tool — you can't reliably know a real-world
+// reference distance while filming live from a handheld phone, and every
+// version of that flow (a card to scroll to, then a banner reminder) still
+// read as broken rather than optional.
+//
+// In its place, this page shows an AUTOMATIC, uncalibrated speed estimate
+// (speed.js's AutoSpeedEstimator) based on each vehicle's detected class and
+// a typical real-world width for that class — no tapping, no setup. It's a
+// rough approximation, not a measurement (a head-on vehicle, an
+// unusually-sized one, or a steep camera angle all throw it off), so it's
+// always shown with an explicit "estimated" label rather than presented as
+// exact. True calibrated speed stays exactly where it already works well:
+// the Streamlit dashboard (dashboard/app.py), which processes a fixed,
+// already-recorded video where a real one-time calibration is practical.
+//
+// No per-vehicle identity (no plates, no leaderboard of individual
+// vehicles) is shown, in keeping with the project's no-identity-data
+// principle — speeds are reported per vehicle class, not per tracked
+// individual.
+//
+// On top of the vehicle-size heuristic, this page also attempts AUTOMATIC
+// GEOMETRIC CALIBRATION from the road's own lane markings (calibration.js):
+// a few seconds after the camera (or an uploaded clip) starts, it looks for
+// two converging lane-boundary lines and, if found, derives a real,
+// scene-specific pixel-to-meter scale from them and an assumed standard
+// lane width — no tapping, no manual input, same as the size heuristic it
+// can override. This is honestly scoped: it's a rigorous scale for motion
+// ACROSS the lane (the dominant case for broadside traffic) but only an
+// approximation for motion straight toward/away from the camera, since that
+// would need an additional camera-height or focal-length assumption lane
+// geometry alone can't supply. See calibration.js for the full method and
+// scope note. When no confident lane geometry can be found (unmarked road,
+// occluded markings, poor lighting), this silently falls back to the
+// per-class size heuristic — the HUD's calibration chip shows which mode is
+// active.
+//
+// On top of THAT, this page also attempts DEPTH-AXIS calibration
+// (depth-calibration.js) right after a successful lane-geometry calibration:
+// if a detected lane line shows a confident standard dashed-marking pattern,
+// it supplies the one additional real-world length needed to get a rigorous
+// scale for motion straight toward/away from the camera too — the exact gap
+// calibration.js's own scope note above flags. When found, speed.js combines
+// it with the lateral scale via Math.hypot for a real 2D ground-plane
+// measurement instead of applying one scale to the full pixel displacement.
+// Just as silent a fallback as the rest of this calibration chain: most
+// scenes won't show a confident dash pattern (solid lines, faded paint, a
+// non-US-standard cycle length), and that's fine — it just means depth
+// motion keeps using the lateral-scale approximation, exactly as before this
+// was added.
+import { VehicleDetector } from "./detector.js";
+import { IouTracker } from "./tracker.js";
+import { AutoSpeedEstimator } from "./speed.js";
+import { ShakeDetector } from "./motion.js";
+import { detectLaneGeometry, PerspectiveCalibration, toGrayscale } from "./calibration.js";
+import { detectDepthCalibrationFromGeometry, DepthCalibration } from "./depth-calibration.js";
+import { isWithinScoringRoi } from "./roi.js";
+import { classifyTilt } from "./tilt.js";
+import { classifyMeasurementConfidence } from "./confidence.js";
+import { MODEL_INPUT_SIZE } from "./postprocess.js";
+import { fetchRoadSafetyContext, getNearbySpeedLimit, cToF, kmhToMph, mmToIn, metersToMiles, compassDirection, aqiCategory } from "./context.js";
+import {
+  SUPPORTED_LANGUAGES,
+  t,
+  getLanguage,
+  setLanguage,
+  detectInitialLanguage,
+  weatherLabel,
+  localizedAqiCategory,
+  localizedCompass,
+} from "./i18n.js";
+
+// --- Language picker ----------------------------------------------------
+// First thing on the page, per the on-device page getting the same
+// language choice the dashboard already has. Selection is remembered in
+// this browser only (localStorage), same spirit as the unit toggle below.
+
+const langRow = document.getElementById("lang-row");
+for (const [code, label] of Object.entries(SUPPORTED_LANGUAGES)) {
+  const chip = document.createElement("button");
+  chip.type = "button";
+  chip.className = "chip lang-chip";
+  chip.textContent = label;
+  chip.dataset.lang = code;
+  chip.addEventListener("click", () => applyLanguage(code));
+  langRow.appendChild(chip);
+}
+
+function updateLangChipState() {
+  const current = getLanguage();
+  for (const chip of langRow.querySelectorAll(".lang-chip")) {
+    chip.classList.toggle("active", chip.dataset.lang === current);
+  }
+}
+
+function localizeStaticText() {
+  for (const el of document.querySelectorAll("[data-i18n]")) {
+    el.textContent = t(el.dataset.i18n);
+  }
+  document.title = t("doc_title");
+  document.documentElement.lang = getLanguage();
+}
+
+// Declared here (rather than down by the rest of the road-safety-context
+// code that reads it) so applyLanguage() can safely reference it below,
+// including on the very first call made at page-load time.
+let lastContext = null;
+
+function applyLanguage(code) {
+  setLanguage(code);
+  localizeStaticText();
+  updateLangChipState();
+  // Re-render anything already on screen that holds live, language-specific
+  // text, so switching languages mid-use doesn't leave stale English stuck
+  // in a status line or the road-safety grid.
+  if (lastContext) renderRoadSafetyContext(lastContext);
+}
+
+// Apply the remembered (or browser-default) language before anything else
+// renders, so the very first status message and card text are already in
+// the right language rather than flashing English first.
+applyLanguage(detectInitialLanguage());
+
+const video = document.getElementById("source");
+const overlay = document.getElementById("overlay");
+const overlayCtx = overlay.getContext("2d");
+const statusEl = document.getElementById("status");
+const fileInput = document.getElementById("file-input");
+const fileButton = document.getElementById("file-button");
+const cameraButton = document.getElementById("camera-button");
+const hudClock = document.getElementById("hud-clock");
+
+const scratch = document.createElement("canvas");
+scratch.width = MODEL_INPUT_SIZE;
+scratch.height = MODEL_INPUT_SIZE;
+const scratchCtx = scratch.getContext("2d", { willReadFrequently: true });
+
+// A separate canvas for lane-geometry calibration (see calibration.js):
+// deliberately NOT the detector's `scratch` canvas above, which is forced
+// to a square MODEL_INPUT_SIZE for the ML model and would distort the
+// road's real aspect ratio, throwing off the line-slope math. This one
+// keeps the video's native aspect ratio at a modest fixed resolution —
+// enough detail for a Sobel+Hough pass on lane markings, small enough to
+// stay fast on a mid-range phone.
+const CALIBRATION_FRAME_HEIGHT = 240;
+const calibrationCanvas = document.createElement("canvas");
+const calibrationCtx = calibrationCanvas.getContext("2d", { willReadFrequently: true });
+
+const detector = new VehicleDetector();
+const tracker = new IouTracker();
+const speedEstimator = new AutoSpeedEstimator();
+const shakeDetector = new ShakeDetector();
+const stabilityNoticeEl = document.getElementById("stability-notice");
+let startTime = null;
+let running = false;
+
+// --- Automatic perspective calibration from lane geometry ---------------
+// Distinct from the per-class vehicle-size heuristic in speed.js: when the
+// camera can see lane markings, this derives an actual, scene-specific
+// pixel-to-meter scale (see calibration.js for the full method and its
+// honestly-documented scope — lateral motion only). Falls back silently to
+// the heuristic whenever no confident lane geometry is found.
+let perspectiveCalibration = null;
+// Depth-axis scale (depth-calibration.js), attempted alongside the lateral
+// perspectiveCalibration above whenever a lane line shows a confident
+// dashed-marking pattern. Independent of perspectiveCalibration in whether
+// it succeeds (a scene can have clean lane geometry but a solid, non-dashed
+// line, or vice versa) but only ever attempted once lane geometry itself has
+// already been found, since it reuses that geometry's vanishing point.
+let depthCalibration = null;
+let calibrationAttempts = 0;
+const MAX_CALIBRATION_ATTEMPTS = 6; // a handful of tries over the first ~20s, then give up quietly
+const calibrationChipEl = document.getElementById("hud-calibration-chip");
+
+function renderCalibrationStatus() {
+  if (!calibrationChipEl) return;
+  calibrationChipEl.textContent = perspectiveCalibration
+    ? t("hud_calibration_geometry")
+    : t("hud_calibration_heuristic");
+}
+renderCalibrationStatus();
+
+/**
+ * Tries once to recover lane geometry from the current video frame and, on
+ * success, builds a PerspectiveCalibration from it. Safe to call repeatedly
+ * — it no-ops once a calibration is already in hand or attempts run out, so
+ * callers can just keep retrying on a timer without extra bookkeeping.
+ */
+function attemptCalibration() {
+  if (perspectiveCalibration) return;
+  if (calibrationAttempts >= MAX_CALIBRATION_ATTEMPTS) return;
+  if (!video.videoWidth || !video.videoHeight) return;
+  calibrationAttempts++;
+  const scale = CALIBRATION_FRAME_HEIGHT / video.videoHeight;
+  const w = Math.round(video.videoWidth * scale);
+  const h = CALIBRATION_FRAME_HEIGHT;
+  if (calibrationCanvas.width !== w || calibrationCanvas.height !== h) {
+    calibrationCanvas.width = w;
+    calibrationCanvas.height = h;
+  }
+  calibrationCtx.drawImage(video, 0, 0, w, h);
+  let imageData;
+  try {
+    imageData = calibrationCtx.getImageData(0, 0, w, h);
+  } catch {
+    return; // e.g. a tainted canvas from a cross-origin file source
+  }
+  const geometry = detectLaneGeometry(imageData.data, w, h);
+  if (!geometry) return;
+  // The detected lines are in the downscaled calibration frame's pixel
+  // space; metersPerPixelAt is applied to full-resolution detection boxes
+  // in frameLoop, so the lines are scaled back up to video pixel space here
+  // rather than scaling every detection down on every frame.
+  const invScale = 1 / scale;
+  const scaled = (line) => ({ m: line.m * invScale, b: line.b * invScale });
+  perspectiveCalibration = new PerspectiveCalibration(scaled(geometry.leftLine), scaled(geometry.rightLine));
+
+  // Depth-axis calibration (see depth-calibration.js) reuses this same
+  // captured frame and detected geometry — no extra capture or detection
+  // pass needed. Solved in the downscaled calibration frame's coordinate
+  // space (same as the lane lines above), then rescaled to full video
+  // pixel space: a depth constant C obeys Z(y) = C/(y - vpY), and scaling
+  // both y and vpY by invScale means C must scale by invScale too for Z to
+  // come out the same real-world distance. Silently left null (the
+  // lateral-only approximation) when no confident dash pattern is found,
+  // exactly like perspectiveCalibration itself falls back to the per-class
+  // heuristic.
+  const gray = toGrayscale(imageData.data, w, h);
+  const rawDepthCalibration = detectDepthCalibrationFromGeometry(gray, w, h, geometry);
+  if (rawDepthCalibration) {
+    depthCalibration = new DepthCalibration(rawDepthCalibration.depthConstant * invScale, geometry.vanishingPoint.y * invScale);
+  }
+  renderCalibrationStatus();
+}
+
+let calibrationTimer = null;
+
+/** Starts (or restarts) the bounded calibration-attempt schedule for a
+ * fresh camera session. Spaced out rather than attempted every frame: lane
+ * detection is comparatively expensive, and the best window to try is once
+ * the camera has steadied after startup, not during the initial jostle of
+ * picking up the phone and aiming it. */
+function startCalibrationSchedule() {
+  perspectiveCalibration = null;
+  depthCalibration = null;
+  calibrationAttempts = 0;
+  renderCalibrationStatus();
+  if (calibrationTimer) clearInterval(calibrationTimer);
+  calibrationTimer = setInterval(() => {
+    attemptCalibration();
+    if (perspectiveCalibration || calibrationAttempts >= MAX_CALIBRATION_ATTEMPTS) {
+      clearInterval(calibrationTimer);
+      calibrationTimer = null;
+    }
+  }, 3000);
+}
+
+// Shared unit preference for every speed/temperature shown on this page
+// (vehicle speeds here, and the road-safety weather/speed-limit card
+// further down) — one toggle, wherever it's clicked, updates both.
+const units = { temp: "c", speed: "mph" };
+const MPH_TO_KMH = 1.609344;
+
+function formatVehicleSpeed(mph) {
+  if (mph == null) return "—";
+  return units.speed === "kmh" ? `${Math.round(mph * MPH_TO_KMH)} km/h` : `${Math.round(mph)} mph`;
+}
+
+// Expresses a vehicle's estimated speed relative to the posted limit for
+// the road (hudSpeedLimitKmh, set once per session once geolocation
+// resolves — see fetchHudSpeedLimit below). Returns null whenever there's
+// nothing to compare against yet, so callers can simply omit the
+// comparison rather than showing a misleading 0%.
+function speedVsLimit(vehicleMph) {
+  if (vehicleMph == null || hudSpeedLimitKmh == null || !(hudSpeedLimitKmh > 0)) return null;
+  const limitMph = hudSpeedLimitKmh / MPH_TO_KMH;
+  const pct = Math.round(Math.abs(((vehicleMph - limitMph) / limitMph) * 100));
+  if (vehicleMph > limitMph) return { text: t("hud_pct_above_limit", { pct }), className: "over" };
+  if (vehicleMph < limitMph) return { text: t("hud_pct_below_limit", { pct }), className: "under" };
+  return { text: t("hud_at_speed_limit"), className: "neutral" };
+}
+
+function setStatus(text) {
+  statusEl.textContent = text;
+}
+
+function tickHudClock() {
+  if (!hudClock) return;
+  hudClock.textContent = new Date().toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+tickHudClock();
+setInterval(tickHudClock, 1000);
+
+// --- Video source: camera or uploaded file ----------------------------
+
+fileButton.addEventListener("click", () => fileInput.click());
+
+fileInput.addEventListener("change", () => {
+  const file = fileInput.files[0];
+  if (!file) return;
+  video.srcObject = null;
+  video.src = URL.createObjectURL(file);
+  video.play();
+  setStatus(t("status_playing_file"));
+  // A new source has its own independent media clock (an uploaded file
+  // starts its timestamps back at 0, same as a fresh camera stream would),
+  // so the elapsed-time baseline used for speed math needs to restart too —
+  // otherwise switching sources mid-session could make the next frame's
+  // elapsed time appear to jump backwards.
+  startTime = null;
+  // Lane geometry is just as valid to calibrate from in an uploaded clip as
+  // live camera footage, so the same automatic attempt applies here too.
+  startCalibrationSchedule();
+});
+
+function handleDeviceMotion(event) {
+  const acc = event.acceleration || event.accelerationIncludingGravity;
+  if (!acc) return;
+  shakeDetector.update(acc.x, acc.y, acc.z);
+}
+
+// Only meaningful for the live camera (an uploaded file has no "camera
+// movement" of its own to detect) and only wired up once the camera
+// actually starts, since iOS requires the permission prompt to happen in
+// direct response to a user gesture. On a device/browser without a motion
+// sensor, or if permission is denied, this silently no-ops — ShakeDetector
+// then stays at its default "steady" state forever, so the feature simply
+// doesn't engage rather than breaking anything.
+function startMotionGuard() {
+  if (typeof DeviceMotionEvent !== "undefined" && typeof DeviceMotionEvent.requestPermission === "function") {
+    DeviceMotionEvent.requestPermission()
+      .then((state) => {
+        if (state === "granted") window.addEventListener("devicemotion", handleDeviceMotion);
+      })
+      .catch(() => {});
+  } else if (typeof window !== "undefined" && "DeviceMotionEvent" in window) {
+    window.addEventListener("devicemotion", handleDeviceMotion);
+  }
+}
+
+// --- Camera-tilt guidance (see tilt.js for the method and its honestly
+// stated scope: portrait orientation only, pitch reported as a magnitude
+// rather than a guessed direction) --------------------------------------
+const tiltChipEl = document.getElementById("hud-tilt-chip");
+let latestTilt = { status: "unknown", rollDeg: null, pitchOffsetDeg: null };
+
+function getScreenAngleDeg() {
+  // screen.orientation.angle is the modern API; window.orientation is the
+  // older (still-needed-on-some-iOS) fallback. Defaults to 0 (portrait) when
+  // neither is available, which is the common case on a desktop browser
+  // testing with an uploaded file rather than a real device sensor.
+  if (typeof screen !== "undefined" && screen.orientation && typeof screen.orientation.angle === "number") {
+    return screen.orientation.angle;
+  }
+  if (typeof window !== "undefined" && typeof window.orientation === "number") return window.orientation;
+  return 0;
+}
+
+function renderTiltStatus() {
+  if (!tiltChipEl) return;
+  if (latestTilt.status === "unknown") {
+    tiltChipEl.hidden = true;
+    return;
+  }
+  tiltChipEl.hidden = false;
+  tiltChipEl.classList.toggle("tilt-warning", latestTilt.status === "tilted");
+  tiltChipEl.textContent =
+    latestTilt.status === "level"
+      ? t("hud_tilt_level")
+      : t("hud_tilt_warning", { deg: Math.round(latestTilt.pitchOffsetDeg) });
+}
+
+function handleDeviceOrientation(event) {
+  latestTilt = classifyTilt(event.beta, event.gamma, getScreenAngleDeg());
+  renderTiltStatus();
+}
+
+// --- Measurement confidence (see confidence.js) -------------------------
+const confidenceChipEl = document.getElementById("hud-confidence-chip");
+const CONFIDENCE_LEVEL_RANK = { low: 0, medium: 1, high: 2 };
+
+// Reports the WORST confidence level among currently-visible vehicles, not
+// an average — for a measurement-trust indicator, understating how much to
+// trust the numbers on screen is the safe direction to be wrong in, and one
+// badly-tracked vehicle shouldn't be hidden behind several good ones.
+function renderConfidenceChip(confidenceByTrackId) {
+  if (!confidenceChipEl) return;
+  if (confidenceByTrackId.size === 0) {
+    confidenceChipEl.hidden = true;
+    return;
+  }
+  let worstLevel = "high";
+  for (const { level } of confidenceByTrackId.values()) {
+    if (CONFIDENCE_LEVEL_RANK[level] < CONFIDENCE_LEVEL_RANK[worstLevel]) worstLevel = level;
+  }
+  confidenceChipEl.hidden = false;
+  confidenceChipEl.classList.remove("confidence-high", "confidence-medium", "confidence-low");
+  confidenceChipEl.classList.add(`confidence-${worstLevel}`);
+  confidenceChipEl.textContent = t(`hud_confidence_${worstLevel}`);
+}
+
+// Same permission pattern as startMotionGuard above — DeviceOrientationEvent
+// needs its own, separate iOS permission prompt from DeviceMotionEvent, and
+// both must fire in direct response to the same user gesture (the camera
+// button click). Fails open exactly like the motion guard: no sensor, or
+// permission denied, just means tilt guidance never appears rather than
+// breaking anything.
+function startTiltGuard() {
+  if (typeof DeviceOrientationEvent !== "undefined" && typeof DeviceOrientationEvent.requestPermission === "function") {
+    DeviceOrientationEvent.requestPermission()
+      .then((state) => {
+        if (state === "granted") window.addEventListener("deviceorientation", handleDeviceOrientation);
+      })
+      .catch(() => {});
+  } else if (typeof window !== "undefined" && "DeviceOrientationEvent" in window) {
+    window.addEventListener("deviceorientation", handleDeviceOrientation);
+  }
+}
+
+cameraButton.addEventListener("click", async () => {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+    video.src = "";
+    video.srcObject = stream;
+    await video.play();
+    setStatus(t("status_camera_on"));
+    startTime = null; // fresh media clock for this stream — see the fileInput handler for why
+    // Only for the live camera, not an uploaded file: the posted speed
+    // limit is only meaningful for wherever the phone actually is right
+    // now, which is only true when it's filming live. A video uploaded
+    // from somewhere else would get a nearby-to-you limit that has
+    // nothing to do with where it was recorded.
+    fetchHudSpeedLimit();
+    startMotionGuard();
+    startTiltGuard();
+    startCalibrationSchedule();
+  } catch (err) {
+    setStatus(t("status_camera_error"));
+  }
+});
+
+// --- Drawing and the detect/track loop ---------------------------------
+
+// Draws a virtual-horizon line through the center of the frame, rotated by
+// the phone's current left-right bank (roll) so it stays visually level
+// with the real world even as the device tilts underneath it — the same
+// idea as a bubble/spirit-level or an aircraft attitude indicator. Rotating
+// by the NEGATIVE of the device's roll is what gives this the right sense:
+// as the phone banks right, the drawn line rotates to appear to lean left
+// relative to the screen, exactly like a real horizon would. Only drawn
+// when a roll reading is actually available (see tilt.js for when that's
+// not the case) — silently skipped otherwise rather than drawing a
+// misleading flat line.
+function drawTiltHorizon(ctx, width, height) {
+  if (latestTilt.rollDeg == null) return;
+  const cx = width / 2;
+  const cy = height / 2;
+  const halfLen = Math.min(width, height) * 0.22;
+  const angleRad = (-latestTilt.rollDeg * Math.PI) / 180;
+  const dx = Math.cos(angleRad) * halfLen;
+  const dy = Math.sin(angleRad) * halfLen;
+  ctx.save();
+  ctx.strokeStyle = latestTilt.status === "level" ? "#2fae5aee" : "#e5484dee";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(cx - dx, cy - dy);
+  ctx.lineTo(cx + dx, cy + dy);
+  ctx.stroke();
+  // A short fixed crosshair tick at center (does NOT rotate) gives a
+  // reference for how far the rotating line has departed from level.
+  ctx.strokeStyle = "#f3f1eecc";
+  ctx.beginPath();
+  ctx.moveTo(cx - 6, cy);
+  ctx.lineTo(cx + 6, cy);
+  ctx.moveTo(cx, cy - 6);
+  ctx.lineTo(cx, cy + 6);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawDetections(detections, speedByTrackId = new Map()) {
+  overlay.width = video.videoWidth;
+  overlay.height = video.videoHeight;
+  overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
+  drawTiltHorizon(overlayCtx, overlay.width, overlay.height);
+
+  // A box's own label sits above it when there's room, but with several
+  // vehicles close together near the top of the frame (a common case —
+  // distant traffic is both small and clustered) stacking every label
+  // right above its box makes neighboring labels overlap into unreadable
+  // text. Sorting by box width (bigger/closer vehicles drawn last, so
+  // their labels win any remaining overlap) and keeping labels short and
+  // clamped to the canvas keeps this readable without needing a layout
+  // engine.
+  const ordered = [...detections].sort((a, b) => a.x2 - a.x1 - (b.x2 - b.x1));
+
+  for (const det of ordered) {
+    const boxWidth = det.x2 - det.x1;
+    const boxHeight = det.y2 - det.y1;
+    overlayCtx.strokeStyle = "#ff6b1f";
+    overlayCtx.lineWidth = 2.5;
+    // A dashed box marks a frame where this vehicle was only matched via
+    // tracker.js's low-confidence second stage (see its header) — a brief,
+    // partially occluded moment rather than a clean detection. Same
+    // transparency-over-polish instinct as every other honesty label on
+    // this page: the box is still drawn (so the vehicle doesn't just
+    // vanish), but visibly marked as a lower-quality frame.
+    overlayCtx.setLineDash(det.fromLowConfidence ? [6, 4] : []);
+    overlayCtx.strokeRect(det.x1, det.y1, boxWidth, boxHeight);
+    overlayCtx.setLineDash([]);
+
+    // Small/distant boxes get a smaller label so it doesn't dwarf the
+    // vehicle it's labeling or collide with a neighbor's. The estimated
+    // speed is also left off a compact label — a small, distant box gives
+    // the width-based estimate the least pixel precision to work with, so
+    // that's the case where showing a confident-looking number would be
+    // most misleading.
+    const compact = boxWidth < 70 || boxHeight < 50;
+    const fontSize = compact ? 11 : 14;
+    const speed = speedByTrackId.get(det.trackId);
+    const label = !compact && speed != null ? `${det.className} · ${formatVehicleSpeed(speed)}` : det.className;
+
+    overlayCtx.font = `${fontSize}px sans-serif`;
+    const textWidth = overlayCtx.measureText(label).width;
+    const boxH = fontSize + 6;
+
+    // Keep the label inside the canvas on every edge, and flip it below
+    // the box instead of off the top of the frame when the vehicle is
+    // near the top edge — the exact spot where close, overlapping labels
+    // were getting cut off and unreadable.
+    let labelX = Math.min(Math.max(det.x1, 0), overlay.width - textWidth - 8);
+    let labelY = det.y1 - boxH >= 0 ? det.y1 - boxH : det.y2;
+
+    overlayCtx.fillStyle = "#0c0c0ecc";
+    overlayCtx.fillRect(labelX, labelY, textWidth + 8, boxH);
+    overlayCtx.fillStyle = "#f3f1ee";
+    overlayCtx.fillText(label, labelX + 4, labelY + boxH - 6);
+  }
+}
+
+// --- HUD read-outs: a vehicles-now summary, flow, and detection
+// confidence. All derived from the same `tracked` array and raw detection
+// scores the loop below already computes — nothing extra is measured or
+// invented for these panels, and nothing here needs a calibration step.
+
+const vehicleListEl = document.getElementById("vehicle-list");
+const flowValueEl = document.getElementById("stat-flow-value");
+const flowBarEl = document.getElementById("stat-flow-bar");
+const confidenceValueEl = document.getElementById("stat-confidence-value");
+const confidenceBarEl = document.getElementById("stat-confidence-bar");
+const speedValueEl = document.getElementById("stat-speed-value");
+const speedBarEl = document.getElementById("stat-speed-bar");
+
+const firstSeenByTrack = new Map(); // trackId -> timestampS, for the flow rate
+
+// Remembers the last frame's results so the unit toggle below can
+// re-render the speed displays immediately, without waiting on the next
+// detection frame.
+let lastTracked = [];
+let lastSpeedByTrackId = new Map();
+
+function renderVehicleList(tracked, speedByTrackId = new Map()) {
+  if (!vehicleListEl) return;
+  vehicleListEl.innerHTML = "";
+  if (tracked.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "hud-vehicle-empty";
+    empty.textContent = t("hud_no_vehicles");
+    vehicleListEl.appendChild(empty);
+    return;
+  }
+  // Grouped by class, not by individual tracked vehicle (no per-vehicle
+  // identity is shown, per the project's no-identity-data principle), so
+  // speed is averaged per class too.
+  const counts = new Map();
+  const speedSumByClass = new Map();
+  const speedCountByClass = new Map();
+  for (const det of tracked) {
+    counts.set(det.className, (counts.get(det.className) || 0) + 1);
+    const speed = speedByTrackId.get(det.trackId);
+    if (speed != null) {
+      speedSumByClass.set(det.className, (speedSumByClass.get(det.className) || 0) + speed);
+      speedCountByClass.set(det.className, (speedCountByClass.get(det.className) || 0) + 1);
+    }
+  }
+  for (const [className, count] of [...counts.entries()].sort((a, b) => b[1] - a[1])) {
+    const row = document.createElement("div");
+    row.className = "hud-vehicle-row";
+    const label = document.createElement("span");
+    label.className = "hud-vehicle-label";
+    label.textContent = className;
+    const speedEl = document.createElement("span");
+    speedEl.className = "hud-vehicle-speed";
+    const speedSampleCount = speedCountByClass.get(className);
+    const classAvgMph = speedSampleCount ? speedSumByClass.get(className) / speedSampleCount : null;
+    speedEl.textContent = classAvgMph != null ? formatVehicleSpeed(classAvgMph) : "—";
+    const comparison = speedVsLimit(classAvgMph);
+    if (comparison) {
+      const comparisonEl = document.createElement("span");
+      comparisonEl.className = `speed-vs-limit ${comparison.className}`;
+      comparisonEl.textContent = comparison.text;
+      speedEl.appendChild(comparisonEl);
+    }
+    const countEl = document.createElement("span");
+    countEl.className = "hud-vehicle-count";
+    countEl.textContent = count;
+    row.append(label, speedEl, countEl);
+    vehicleListEl.appendChild(row);
+  }
+}
+renderVehicleList([]); // shows the empty state immediately, before the first detection frame
+
+function renderFlowAndConfidence(tracked, rawDetections, timestampS) {
+  for (const det of tracked) {
+    if (!firstSeenByTrack.has(det.trackId)) firstSeenByTrack.set(det.trackId, timestampS);
+  }
+  // Prune tracks last seen over a minute ago so the map doesn't grow
+  // forever across a long session.
+  for (const [id, seenAt] of firstSeenByTrack) {
+    if (timestampS - seenAt > 120) firstSeenByTrack.delete(id);
+  }
+  const recentCount = [...firstSeenByTrack.values()].filter((seenAt) => timestampS - seenAt <= 60).length;
+  if (flowValueEl) flowValueEl.textContent = t("hud_flow_format", { count: recentCount });
+  if (flowBarEl) flowBarEl.style.width = `${Math.min(100, recentCount * 8)}%`;
+
+  if (rawDetections.length > 0) {
+    const meanScore = rawDetections.reduce((sum, d) => sum + d.score, 0) / rawDetections.length;
+    const pct = Math.round(meanScore * 100);
+    if (confidenceValueEl) confidenceValueEl.textContent = `${pct}%`;
+    if (confidenceBarEl) confidenceBarEl.style.width = `${pct}%`;
+  } else {
+    if (confidenceValueEl) confidenceValueEl.textContent = "—";
+    if (confidenceBarEl) confidenceBarEl.style.width = "0%";
+  }
+}
+
+// Scaled against a round, generous 80 mph ceiling just to give the bar
+// something to fill toward — it's a glanceable indicator, not a precise
+// gauge (the number next to it is the actual estimate).
+const SPEED_BAR_CEILING_MPH = 80;
+
+function renderAvgSpeedStat(speedByTrackId) {
+  const speeds = [...speedByTrackId.values()];
+  if (speeds.length === 0) {
+    if (speedValueEl) speedValueEl.textContent = "—";
+    if (speedBarEl) speedBarEl.style.width = "0%";
+    return;
+  }
+  const avgMph = speeds.reduce((sum, s) => sum + s, 0) / speeds.length;
+  if (speedValueEl) {
+    speedValueEl.textContent = formatVehicleSpeed(avgMph);
+    const comparison = speedVsLimit(avgMph);
+    if (comparison) {
+      const comparisonEl = document.createElement("span");
+      comparisonEl.className = `speed-vs-limit ${comparison.className}`;
+      comparisonEl.textContent = comparison.text;
+      speedValueEl.appendChild(comparisonEl);
+    }
+  }
+  if (speedBarEl) speedBarEl.style.width = `${Math.min(100, (avgMph / SPEED_BAR_CEILING_MPH) * 100)}%`;
+}
+renderAvgSpeedStat(new Map());
+
+// --- Posted speed limit for wherever the phone is right now -------------
+// A lightweight, standalone lookup (just OpenStreetMap's nearby maxspeed
+// tag, not the full road-safety-context fetch further down the page,
+// which also pulls World Bank/WHO/weather/air-quality data this HUD row
+// doesn't need) so a vehicle's estimated speed can be read against the
+// actual posted limit at a glance, without scrolling down and pressing a
+// separate button. Asked for once per page load, the moment the live
+// camera actually starts (see the cameraButton handler above) — not on
+// page load itself, so the browser's location prompt only appears once
+// there's a real reason for it.
+// Two places show this value: the "Live stats" card below the video (for
+// anyone who scrolls down), and a chip overlaid directly on the camera
+// view (".speedlimit-value") so it's visible at a glance while filming,
+// without scrolling — both are kept in sync from the same state here.
+const speedLimitValueEls = document.querySelectorAll("#stat-speedlimit-value, .speedlimit-value");
+let hudSpeedLimitKmh = null;
+let hudSpeedLimitNote = null; // shown instead of a value when there isn't one (denied/unavailable/no data)
+let speedLimitRequested = false;
+
+function renderHudSpeedLimit() {
+  const text = hudSpeedLimitKmh != null ? formatSpeed(hudSpeedLimitKmh) : hudSpeedLimitNote || "—";
+  for (const el of speedLimitValueEls) el.textContent = text;
+}
+renderHudSpeedLimit();
+
+function fetchHudSpeedLimit() {
+  if (speedLimitRequested) return; // ask once per page load, not on every camera restart
+  speedLimitRequested = true;
+  if (!("geolocation" in navigator)) {
+    hudSpeedLimitNote = t("hud_speedlimit_unavailable");
+    renderHudSpeedLimit();
+    return;
+  }
+  navigator.geolocation.getCurrentPosition(
+    async (position) => {
+      try {
+        const result = await getNearbySpeedLimit(position.coords.latitude, position.coords.longitude);
+        if (result && result.maxspeedKmh != null) {
+          hudSpeedLimitKmh = result.maxspeedKmh;
+          hudSpeedLimitNote = null;
+        } else {
+          hudSpeedLimitNote = t("hud_speedlimit_no_data");
+        }
+      } catch {
+        hudSpeedLimitNote = t("hud_speedlimit_unavailable");
+      }
+      renderHudSpeedLimit();
+    },
+    () => {
+      hudSpeedLimitNote = t("hud_speedlimit_denied");
+      renderHudSpeedLimit();
+    },
+    { timeout: 10000 }
+  );
+}
+
+// Ties each detection pass to an actual decoded video frame rather than the
+// display's refresh rate: requestAnimationFrame fires on every repaint even
+// when the video hasn't produced a new frame yet (a slower camera feed, a
+// throttled background tab, or simply a display refreshing faster than the
+// video decodes), which wastes a full detector pass re-processing the same
+// pixels and can skew timestampS's effective sampling interval. Falls back
+// to the previous requestAnimationFrame-driven loop on browsers that don't
+// support it yet (rVFC's browser support is good but not universal) — the
+// fallback path reproduces the exact old behavior, so nothing regresses.
+const supportsVideoFrameCallback = typeof video.requestVideoFrameCallback === "function";
+
+function scheduleNextFrame() {
+  if (video.paused || video.ended) {
+    // Nothing to process yet — requestVideoFrameCallback never fires on a
+    // paused/ended video, so poll cheaply with rAF until there's a frame to
+    // wait on again (covers the gap between page load and the user actually
+    // starting the camera or picking a file).
+    requestAnimationFrame(scheduleNextFrame);
+    return;
+  }
+  if (supportsVideoFrameCallback) {
+    video.requestVideoFrameCallback((_now, metadata) => frameLoop(metadata.mediaTime));
+  } else {
+    requestAnimationFrame(() => frameLoop(performance.now() / 1000));
+  }
+}
+
+async function frameLoop(mediaTimeS) {
+  if (!running || video.paused || video.ended) {
+    scheduleNextFrame();
+    return;
+  }
+  // mediaTimeS is the video element's own presentation clock (seconds,
+  // zeroed at the start of this source — see the startTime resets in the
+  // fileInput/cameraButton handlers above) rather than wall-clock time, so
+  // it tracks actual frame delivery instead of requestAnimationFrame's
+  // display-refresh cadence.
+  if (startTime === null) startTime = mediaTimeS;
+  const timestampS = mediaTimeS - startTime;
+
+  // Tiered detection (see detector.js/postprocess.js/tracker.js): the
+  // normal-confidence set is used for display and can start new tracks,
+  // same as always; the low-confidence set can only extend a track that
+  // the normal set failed to match this frame, letting a briefly, partially
+  // occluded vehicle's track survive with an updated position instead of
+  // just going quiet for a frame.
+  const { detections: raw, lowConfidenceDetections } = await detector.detectTiered(
+    video,
+    scratchCtx,
+    video.videoWidth,
+    video.videoHeight,
+    { confThreshold: 0.3, lowConfThreshold: 0.1 }
+  );
+  const tracked = tracker.update(raw, lowConfidenceDetections);
+
+  // Road point = box bottom-center (where the vehicle meets the road),
+  // same point speed.js's calibrated estimator used — see its update()
+  // signature for why that's the point to track rather than the box center.
+  // While the phone itself is being moved/panned (per shakeDetector), skip
+  // feeding this frame's positions into the estimator rather than resetting
+  // a vehicle's history — a brief shake just pauses new samples; the
+  // existing window of good samples keeps smoothing once it steadies again.
+  // See motion.js for why a moving camera makes every box's apparent
+  // motion unreliable, not just the ones that look wrong.
+  const steady = shakeDetector.isSteady();
+  const speedByTrackId = new Map();
+  // Per-vehicle measurement confidence (confidence.js), built from signals
+  // already computed elsewhere on this page — see that module for what
+  // feeds into it and why. Only set for vehicles that actually got a speed
+  // this frame, since there's nothing to rate confidence in otherwise.
+  const confidenceByTrackId = new Map();
+  if (steady) {
+    for (const det of tracked) {
+      const boxWidthPx = det.x2 - det.x1;
+      const boxHeightPx = det.y2 - det.y1;
+      const roadX = (det.x1 + det.x2) / 2;
+      const roadY = det.y2;
+      // Skip this frame's sample (without discarding the vehicle's existing
+      // history, same treatment as a camera-shake frame above) whenever its
+      // road point falls in the outer edge margin — see roi.js for why:
+      // that's where a phone lens's radial distortion is worst, and a
+      // vehicle only passes through there briefly as it enters/exits frame
+      // anyway, so this costs little coverage for a real accuracy gain.
+      if (!isWithinScoringRoi(roadX, video.videoWidth)) continue;
+      // boxHeightPx lets the estimator tell a broadside vehicle (wide, short
+      // box -> scale by vehicle length) from a head-on/rear-on one (taller,
+      // squarer box -> scale by vehicle width) — see speed.js for why that
+      // distinction was previously the single biggest source of
+      // underestimated speeds. When lane geometry has been successfully
+      // calibrated (see attemptCalibration above), its scene-derived scale
+      // at this exact road row takes priority over the assumed-size
+      // heuristic entirely — see speed.js's metersPerPixelOverride.
+      const metersPerPixelOverride = perspectiveCalibration ? perspectiveCalibration.metersPerPixelAt(roadY) : null;
+      // depthCalibration (depth-calibration.js) only actually changes
+      // anything inside speed.js when BOTH points in a pair carry it and a
+      // metersPerPixelOverride — passing it here whenever it exists is safe
+      // even on a frame where lane geometry (and so metersPerPixelOverride)
+      // temporarily isn't available; speed.js just falls back as usual.
+      const speed = speedEstimator.update(
+        det.trackId,
+        det.className,
+        roadX,
+        roadY,
+        boxWidthPx,
+        timestampS,
+        boxHeightPx,
+        metersPerPixelOverride,
+        depthCalibration
+      );
+      if (speed != null) {
+        speedByTrackId.set(det.trackId, speed);
+        confidenceByTrackId.set(
+          det.trackId,
+          classifyMeasurementConfidence({
+            steady,
+            tiltStatus: latestTilt.status,
+            usedGeometricCalibration: metersPerPixelOverride != null,
+            trackletFrames: speedEstimator.getSampleCount(det.trackId),
+          })
+        );
+      }
+    }
+  }
+  speedEstimator.prune(timestampS);
+  if (stabilityNoticeEl) stabilityNoticeEl.hidden = steady;
+
+  drawDetections(tracked, speedByTrackId);
+  renderVehicleList(tracked, speedByTrackId);
+  renderFlowAndConfidence(tracked, raw, timestampS);
+  renderAvgSpeedStat(speedByTrackId);
+  renderConfidenceChip(confidenceByTrackId);
+  lastTracked = tracked;
+  lastSpeedByTrackId = speedByTrackId;
+  scheduleNextFrame();
+}
+
+async function main() {
+  setStatus(t("status_model_loading"));
+  await detector.load("models/yolo11n.onnx");
+  setStatus(t("status_ready"));
+  running = true;
+  scheduleNextFrame();
+}
+
+main().catch(() => setStatus(t("status_model_error")));
+
+// --- Road safety context (World Bank/WHO/OSM/weather, client-side) ----
+// Weather-code/AQI-category/compass labels are translated at render time
+// via i18n.js's weatherLabel()/localizedAqiCategory()/localizedCompass()
+// helpers, which key off context.js's own (always-English) return values —
+// context.js's tests pin those exact English strings, so they stay
+// untranslated there and only the on-screen label changes here.
+
+const contextButton = document.getElementById("context-button");
+const contextNote = document.getElementById("context-note");
+const contextUnits = document.getElementById("context-units");
+const contextGrid = document.getElementById("context-grid");
+const contextWorldBank = document.getElementById("context-worldbank");
+const contextWho = document.getElementById("context-who");
+const contextSpeedLimit = document.getElementById("context-speedlimit");
+const contextWeather = document.getElementById("context-weather");
+const contextFeelsLike = document.getElementById("context-feelslike");
+const contextHumidity = document.getElementById("context-humidity");
+const contextWind = document.getElementById("context-wind");
+const contextVisibility = document.getElementById("context-visibility");
+const contextSun = document.getElementById("context-sun");
+const contextUv = document.getElementById("context-uv");
+const contextPrecip = document.getElementById("context-precip");
+const contextAqi = document.getElementById("context-aqi");
+
+function setContextField(el, text, available) {
+  el.textContent = text;
+  el.classList.toggle("unavailable", !available);
+}
+
+// lastContext (remembers the last fetch so switching °C/°F or km/h/mph, or
+// switching language, just re-renders — no need to ask the public sources
+// again for a display-only change) is declared near the top of this file,
+// by the language picker, so it exists before applyLanguage()'s first call.
+// `units` itself is also declared near the top of the file (by the speed
+// estimator), since it's shared with the vehicle-speed display above.
+
+function formatTemp(celsius) {
+  if (celsius == null) return null;
+  return units.temp === "f" ? `${Math.round(cToF(celsius))}°F` : `${Math.round(celsius)}°C`;
+}
+
+function formatSpeed(kmh) {
+  if (kmh == null) return null;
+  return units.speed === "mph" ? `${Math.round(kmhToMph(kmh))} mph` : `${Math.round(kmh)} km/h`;
+}
+
+function formatShortTime(isoString) {
+  if (!isoString) return null;
+  const date = new Date(isoString);
+  if (Number.isNaN(date.getTime())) return isoString;
+  return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
+function renderRoadSafetyContext(context) {
+  contextUnits.style.display = "flex";
+  contextGrid.style.display = "grid";
+  const notAvailable = t("value_not_available");
+
+  if (context.worldBank) {
+    setContextField(contextWorldBank, t("wb_rate_format", { rate: context.worldBank.deathsPer100k, year: context.worldBank.year }), true);
+  } else {
+    setContextField(contextWorldBank, notAvailable, false);
+  }
+
+  if (context.who) {
+    setContextField(contextWho, t("who_rate_format", { rate: context.who.deathsPer100k, year: context.who.year }), true);
+  } else {
+    setContextField(contextWho, notAvailable, false);
+  }
+
+  if (context.speedLimit && context.speedLimit.maxspeedKmh != null) {
+    setContextField(contextSpeedLimit, formatSpeed(context.speedLimit.maxspeedKmh), true);
+  } else {
+    setContextField(contextSpeedLimit, t("value_no_road"), false);
+  }
+
+  const w = context.weather;
+  if (w) {
+    const label = weatherLabel(w.weathercode);
+    setContextField(contextWeather, `${label}, ${formatTemp(w.temperatureC)}`, true);
+    setContextField(contextFeelsLike, w.apparentTemperatureC != null ? formatTemp(w.apparentTemperatureC) : notAvailable, w.apparentTemperatureC != null);
+    setContextField(contextHumidity, w.humidityPct != null ? `${Math.round(w.humidityPct)}%` : notAvailable, w.humidityPct != null);
+
+    if (w.windspeedKmh != null) {
+      const dir = compassDirection(w.windDirectionDeg);
+      const localizedDir = dir ? localizedCompass(dir) : null;
+      const gusts = w.windGustsKmh != null ? t("gusts_suffix", { gusts: formatSpeed(w.windGustsKmh) }) : "";
+      setContextField(contextWind, `${formatSpeed(w.windspeedKmh)}${localizedDir ? " " + localizedDir : ""}${gusts}`, true);
+    } else {
+      setContextField(contextWind, notAvailable, false);
+    }
+
+    if (w.visibilityM != null) {
+      const text = units.speed === "mph" ? `${metersToMiles(w.visibilityM).toFixed(1)} mi` : `${(w.visibilityM / 1000).toFixed(1)} km`;
+      setContextField(contextVisibility, text, true);
+    } else {
+      setContextField(contextVisibility, notAvailable, false);
+    }
+
+    if (w.sunrise && w.sunset) {
+      setContextField(contextSun, `${formatShortTime(w.sunrise)} / ${formatShortTime(w.sunset)}`, true);
+    } else {
+      setContextField(contextSun, notAvailable, false);
+    }
+
+    setContextField(contextUv, w.uvIndexMax != null ? `${w.uvIndexMax}` : notAvailable, w.uvIndexMax != null);
+
+    if (w.precipitationSumMm != null) {
+      const text = units.speed === "mph" ? `${mmToIn(w.precipitationSumMm).toFixed(2)} in` : `${w.precipitationSumMm} mm`;
+      setContextField(contextPrecip, text, true);
+    } else {
+      setContextField(contextPrecip, notAvailable, false);
+    }
+  } else {
+    for (const el of [contextWeather, contextFeelsLike, contextHumidity, contextWind, contextVisibility, contextSun, contextUv, contextPrecip]) {
+      setContextField(el, notAvailable, false);
+    }
+  }
+
+  if (context.airQuality && context.airQuality.usAqi != null) {
+    setContextField(contextAqi, t("aqi_format", { aqi: context.airQuality.usAqi, category: localizedAqiCategory(aqiCategory(context.airQuality.usAqi)) }), true);
+  } else {
+    setContextField(contextAqi, notAvailable, false);
+  }
+}
+
+// A single shared unit preference can have chips in more than one place on
+// this page now (the always-visible speed-unit toggle up by the live HUD,
+// and the temp/speed toggle inside the road-safety-context card) — a click
+// on either one updates every matching chip everywhere, not just its own
+// row.
+function setActiveUnitChips(group, value) {
+  for (const chip of document.querySelectorAll(`.unit-chip[data-unit-group="${group}"]`)) {
+    chip.classList.toggle("active", chip.dataset.unit === value);
+  }
+}
+
+for (const chip of document.querySelectorAll(".unit-chip")) {
+  chip.addEventListener("click", () => {
+    const group = chip.dataset.unitGroup;
+    units[group] = chip.dataset.unit;
+    setActiveUnitChips(group, chip.dataset.unit);
+    if (lastContext) renderRoadSafetyContext(lastContext);
+    if (group === "speed") {
+      renderVehicleList(lastTracked, lastSpeedByTrackId);
+      renderAvgSpeedStat(lastSpeedByTrackId);
+      renderHudSpeedLimit();
+    }
+  });
+}
+// Default selection, shown once results appear.
+setActiveUnitChips("temp", units.temp);
+setActiveUnitChips("speed", units.speed);
+
+contextButton.addEventListener("click", () => {
+  if (!("geolocation" in navigator)) {
+    contextNote.textContent = t("note_no_geo");
+    return;
+  }
+  contextNote.textContent = t("note_asking");
+  navigator.geolocation.getCurrentPosition(
+    async (position) => {
+      contextNote.textContent = t("note_looking_up");
+      const { latitude, longitude } = position.coords;
+      try {
+        lastContext = await fetchRoadSafetyContext(latitude, longitude);
+        contextNote.textContent = "";
+        renderRoadSafetyContext(lastContext);
+      } catch {
+        contextNote.textContent = t("note_fetch_error");
+      }
+    },
+    () => {
+      contextNote.textContent = t("note_denied");
+    },
+    { timeout: 10000 }
+  );
+});
+
+// PWA: lets the page be installed (Add to Home Screen) and reused offline
+// after the first successful load. Registration failing (e.g. serviceWorker
+// unsupported, or the page loaded over plain http) is not fatal — the app
+// still works online, it just won't be installable/offline-capable there.
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("sw.js").catch(() => {
+      // Intentionally silent: offline/installable support is a bonus,
+      // not a requirement for the page to function.
+    });
+  });
+}
