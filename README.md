@@ -26,6 +26,10 @@ Each run saves an annotated video, a trajectory CSV, and a speed histogram. Coun
 
 The detection and tracking methods come from existing libraries. The work here is connecting them to road calibration, handling missing or unreliable speed measurements, and making the results inspectable.
 
+## Presentation and real-world examples
+
+**[View the 7-slide project walkthrough](docs/PRESENTATION.md)** — a quick, visual-story companion with live-app links, the actual sample metrics, field-demo interpretation, and source references. The editable slide deck is being prepared for upload; the GitHub walkthrough is already readable without PowerPoint.
+
 ## RoadTrace Analytics — mobile and dashboard extensions
 
 The newer application adds a mobile-browser traffic-observation interface, a multi-video dashboard, public road-safety data adapters and a packaged Python pipeline. **The original project and the saved demonstration in this repository are preserved.**
