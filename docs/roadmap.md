@@ -1,0 +1,795 @@
+# Roadmap
+
+This repo builds a global, zero-cost traffic analytics platform on top of
+RoadTrace's core detection/tracking/speed pipeline (see `ATTRIBUTION.md`).
+Each piece below ships as its own PR, reviewed and merged separately rather
+than as one large change.
+
+## Shipped
+- [x] `core/` — ported pipeline (detector, tracker, speed estimator,
+      analytics, CLI), 24/24 original tests passing
+- [x] `dashboard/` — Streamlit dashboard. Add one or more camera videos,
+      each gets its own calibration and direction labels; counts by
+      vehicle class, direction split (by net pixel displacement, not a
+      compass heading), speed distribution, hourly aggregation across
+      cameras. No identity data. 12/12 new tests passing (36/36 total).
+      **Live**: https://roadtrace-analytics-d.streamlit.app/
+      (free, Streamlit Community Cloud, deployed 2026-10-05); run locally
+      instead with `streamlit run dashboard/app.py`.
+- [x] `dashboard/i18n.py`, `dashboard/units.py` — language picker (English,
+      Hindi, Spanish, Mandarin; JSON string tables, add a language by
+      dropping a new locale file) and speed-unit toggle (km/h default, mph
+      optional; conversion is display-only, core/ and the aggregator still
+      work entirely in mph internally). Translations cover standard UI
+      vocabulary; worth a native-speaker pass before any public launch.
+      15/15 new tests passing (51/51 total).
+- [x] `web/` — on-device detection: a static page running YOLO11n (exported
+      to ONNX; already the nano/smallest variant, so "lite model" turned out
+      to mean exporting it for the browser, not picking a smaller one),
+      onnxruntime-web, and a from-scratch IoU tracker and two-point speed
+      estimator, all client-side via WebAssembly. No server, no upload.
+      22/22 new tests (Node's built-in test runner, pure-logic modules
+      only — see web/README.md for what's not covered and needs a real
+      browser to verify). 73/73 total passing across the whole repo.
+      Known gaps versus core/: simpler tracker (more ID switches
+      expected), two-point calibration only, non-letterboxed resize.
+      **Live**: https://anurodhsingh3862.github.io/RoadTrace-Analytics/
+      (free, GitHub Pages), installable as a PWA.
+      Also includes `web/src/context.js` (2026-10-05): a "Road safety near
+      you" card that brings World Bank/WHO road-death rates, OSM posted
+      speed limit, and current weather onto this same page — previously
+      dashboard-only. On tap, the browser's own location prompt fires and
+      the page calls each public source directly, no server involved,
+      same design as the rest of this page. Does not include NHTSA county
+      crash data (that source is a 30+MB/year bulk file, unreasonable to
+      fetch per page visit — stays dashboard-only). 17/17 new tests
+      passing (39/39 total in web/).
+- [x] `data_layers/` — global and local-tier road-safety context,
+      pluggable per source:
+      - World Bank (`SH.STA.TRAF.P5`) and WHO GHO (`RS_198`) road-traffic
+        death rate per country, shown side by side rather than blended.
+      - OpenStreetMap (Overpass API) posted speed limit + road
+        classification for a specific lat/lon, everywhere OSM has it
+        tagged.
+      Wired into the dashboard: add a country code and/or coordinates
+      when adding a camera to see "Road safety context". Every lookup
+      returns nothing (not a guess) when the source has no data for that
+      place. World Bank and WHO responses were live-verified against the
+      real APIs during development; Overpass could not be reached from
+      the dev sandbox's network policy, so it's built against its
+      documented schema and needs one real-network test run to confirm
+      before being trusted (`python -m data_layers.osm_speed_limit <lat>
+      <lon>`). 15/15 new tests (mocked HTTP) passing.
+      Not yet included: UN regional indicators, ITF/OECD reports, iRAP
+      star ratings, and a country-specific local adapter beyond OSM (e.g.
+      US NHTSA/FHWA) — same pattern, left for a follow-up PR if useful.
+- [x] `data_layers/weather.py` + `dashboard/weather_correlation.py` —
+      hourly weather (temperature, precipitation, wind) from Open-Meteo
+      for a camera's location and recording window, shown per camera, plus
+      a speed-vs-weather table joined by hour across located cameras.
+      Deliberately not a correlation coefficient: a single recording
+      rarely spans enough distinct weather to support one, so this shows
+      the raw side-by-side numbers and a plain caption when the sample is
+      too small to suggest a pattern, rather than computing a statistic
+      that would overstate what a few data points can tell you.
+      Not live-verifiable from the dev sandbox (Open-Meteo's hosts are
+      blocked by both the shell network policy and robots.txt for the
+      fetch tool used during development); built against its long-stable
+      documented schema instead. **Verified 2026-10-05** against real
+      data (Evansville, IN) — realistic diurnal temperature curve, zero
+      precipitation on a dry day, confirmed by the user running
+      `python -m data_layers.weather <lat> <lon> <YYYY-MM-DD>` locally.
+      13/13 new tests (mocked HTTP) passing.
+
+- [x] `dashboard/risk_context.py` — lines up the camera's measured average
+      speed against the OSM-posted limit (and the share of hours that ran
+      over it), the country's background death rate, and the weather
+      during recording. Explicitly not a crash-risk score: no historical
+      crash data exists yet tied to any specific road this platform
+      watches, so nothing here estimates a likelihood of anything — it's
+      the measured facts, arranged, with that limitation stated on
+      screen every time. 15/15 new tests passing.
+      **What a real risk model still needs and doesn't have:** historical
+      crash counts/locations for the exact road a camera watches — see
+      `data_layers/crash_data.py` below for the closest real
+      approximation available so far, and why it still isn't that.
+- [x] `web/manifest.json` + `web/sw.js` — PWA packaging for the on-device
+      page: installable ("Add to Home Screen") with an app icon, and
+      usable offline after the first successful load (the page, its
+      scripts, and whatever model/CDN files were already fetched are
+      cached by the service worker). Zero cost, no app-store account.
+      **Needs a real-phone check**, not just a syntax check: install it
+      from a phone browser, confirm the install prompt/icon appears, then
+      try opening it in airplane mode after one successful load.
+- [x] `data_layers/crash_data.py` — US county-level fatal-crash counts
+      from NHTSA's FARS dataset, wired into `risk_context.py` and the
+      dashboard via an optional 5-digit county FIPS code on the camera
+      form. This is the first real local-tier crash-data source, but it
+      does **not** make risk_context a true risk model yet: FARS is
+      county-wide, not road-specific, and only records *fatal* crashes (a
+      county with zero on file is "zero fatal crashes on record", not
+      "safe"). Both the module docstring and the dashboard say this every
+      time the number is shown.
+      Every live call made to NHTSA's **CrashAPI** (`crashviewer.nhtsa.dot.gov`)
+      during development was rejected with HTTP 403 from an Akamai/edgesuite
+      WAF. A normal browser-like `User-Agent` header (the first attempted
+      fix) did not help, and the user confirmed it isn't Python-specific:
+      opening the exact same API URL directly in their own browser hit the
+      identical "Access Denied" WAF page. This endpoint is unreachable
+      programmatically or otherwise from outside NHTSA's own allowed
+      traffic — not worth any further attempt.
+      **Fixed (2026-10-05) by switching to NHTSA's static bulk-file archive
+      instead**: `static.nhtsa.gov` hosts the entire FARS dataset as plain
+      yearly ZIP files, no key, no bot-protection — a different host than
+      the CrashAPI. The adapter downloads and caches one year's national
+      file (`~/.cache/roadtrace_fars`, one download per year, reused for
+      every county/year lookup after) and counts matching rows itself
+      instead of querying an API.
+      **Live-verified 2026-10-05** by the user: `python -m
+      data_layers.crash_data 18 163 2024` against the real archive
+      returned `CountyCrashStats(state_fips='18', county_fips='163',
+      year=2024, fatal_crash_count=20, fatalities=21, ...)` for
+      Vanderburgh County, IN — a real, in-range number, not a guess.
+      10/10 tests (mocked HTTP + an in-memory ZIP fixture) passing.
+- [x] `dashboard/live.py` — live-camera tab on the dashboard itself
+      (`streamlit-webrtc`), so a visitor doesn't have to upload a
+      pre-recorded file to get counts: clicking the link, opening the
+      "Live camera" expander, and allowing the camera shows running
+      vehicle counts (and, if the two-point calibration is filled in, a
+      speed estimate) from their own browser's camera, live, inside the
+      same free Streamlit Cloud session. Reuses the same
+      detector/tracker as uploaded videos (`core.detector`,
+      `core.tracker`); speed estimation is a new wall-clock-timestamp
+      tracker (`LiveSpeedTracker`), not `core.speed_estimator`, because
+      that one assumes a known constant FPS and a live WebRTC stream's
+      frame rate varies with CPU load — the same reasoning already used
+      for the on-device page's `web/src/speed.js`.
+      **Honest limitation, stated on screen, not just here**: Streamlit
+      Community Cloud's free tier is a shared CPU core with no GPU.
+      Real-time YOLO inference on a live stream will likely run at a few
+      frames per second rather than smooth video. The user explicitly
+      chose to ship this anyway, accepting that lag, after being asked;
+      the on-device page remains the smooth, truly real-time option, and
+      the dashboard's "Live camera" caption says so.
+      Nothing from the camera is recorded or uploaded anywhere — frames
+      exist only in that visitor's own session, for as long as the
+      expander is open.
+      12/12 tests passing for the parts that don't require loading a real
+      model (`ManualCalibration`, `LiveSpeedTracker`, `LiveStats`); the
+      WebRTC video-processor class itself is exercised by a manual boot
+      smoke test (`streamlit run dashboard/app.py` serving HTTP 200 with
+      no import errors), not a unit test, since it loads a real YOLO
+      model at construction.
+      **Fixed (2026-10-05)**: the user reported the live dashboard
+      rendering completely blank on their phone right after this shipped.
+      Two real problems, confirmed against `streamlit-webrtc`'s own
+      documentation: (1) `webrtc_streamer()` was called with no
+      `rtc_configuration` at all — the library's docs explicitly warn
+      that Streamlit Community Cloud needs at least a STUN server
+      configured for the browser↔server video connection to traverse
+      NAT, so it likely never connected; (2) more importantly, the
+      `streamlit_webrtc`/`dashboard.live` import had no fallback, so if
+      that import failed for any reason on the live host (a missing
+      native dependency, a version mismatch), the exception took the
+      *entire* dashboard down with it — not just the live-camera tab.
+      Fixed by (a) adding a free Google STUN server to
+      `rtc_configuration` (zero-cost, no signup — stated honestly on
+      screen that it still may not be enough on carrier-grade mobile
+      networks, since a real TURN relay would need a paid/signed-up
+      service this project avoids), and (b) wrapping the risky import in
+      try/except so a failure there now shows a small "live camera
+      unavailable" notice in just that expander while the rest of the
+      dashboard (including uploading a video) keeps working regardless.
+      Verified by actually uninstalling `streamlit-webrtc` locally and
+      confirming the app still boots and serves HTTP 200 rather than
+      crashing. Full suite still green afterward.
+- [x] `core/__init__.py` — **the actual cause of the dashboard showing a
+      completely blank page**, found by reading the real Streamlit Cloud
+      deploy logs after the STUN/import fix above didn't help (as
+      expected in hindsight - that fix was in `dashboard/app.py`, a file
+      that was never actually being served). The logs showed Streamlit
+      Cloud's configured "main file path" for this deployment is
+      `core/__init__.py`, an empty file - so it loaded, ran nothing,
+      threw no error, and rendered nothing, every time. That setting
+      isn't editable from the current Streamlit Cloud Settings UI (no
+      "main file path" field exists there any more, only App URL/Python
+      version/Sharing/Secrets), and deleting and recreating the app to
+      fix it would assign a new random URL, breaking every link already
+      shared to this one. Fixed by having `core/__init__.py` hand off to
+      `dashboard/app.py` via `runpy.run_path()`, guarded by
+      `if __name__ == "__main__"` so it only fires when Streamlit
+      actually executes this file as the app's entry point - never for
+      the constant ordinary `from core.X import Y` imports used
+      throughout the test suite and the rest of the codebase.
+      Verified two ways: the full test suite still passes unchanged
+      (113/113 - confirming the guard doesn't affect normal imports), and
+      a local `streamlit run core/__init__.py` (reproducing exactly what
+      Streamlit Cloud runs) was screenshotted actually rendering the real
+      dashboard - sidebar, camera form, language picker and all - instead
+      of a blank page.
+- [x] `web/src/i18n.js` — language picker on the on-device page, matching
+      the dashboard's 4 languages (English, Hindi, Spanish, Mandarin).
+      Placed as the very first thing on the page, above the title. Covers
+      every piece of static and dynamic on-screen text: card headers and
+      descriptions, button labels, calibration hints, the location-context
+      note, all 12 road-safety-grid field labels and their live values
+      (weather descriptions, AQI category, compass directions), and the
+      document title. Choice is remembered in this browser only
+      (`localStorage`), never sent anywhere, and persists across reloads.
+      Mirrors `dashboard/i18n.py`'s shape on purpose (same "fall back to
+      English, then to the key itself" behavior) even though this is
+      plain client-side JS with no build step.
+      Weather-code labels, AQI categories, and compass directions all stay
+      in `context.js` as plain, always-English values (its own tests pin
+      those exact strings) and are translated only at render time in
+      `app.js`, so the two layers stay decoupled.
+      12/12 new tests, including a parity test (mirroring
+      `dashboard/test_i18n.py`) that fails if any language's key set ever
+      drifts from English's. Verified end-to-end with a real headless
+      browser (Playwright): clicking each language chip updates every
+      visible string and the document title, and the choice survives a
+      page reload — screenshotted in Hindi, Spanish, and Mandarin.
+
+- [x] `dashboard/export.py` — a JSON export button on the Streamlit
+      dashboard ("Download results as JSON"). Streamlit's own component
+      styling can't produce the polished, glass-card/chart-heavy look the
+      user wants, so the plan is a separate static HTML/CSS/JS dashboard
+      page (same zero-cost GitHub Pages pattern as the on-device page)
+      for *display*, while Streamlit keeps doing what it's good at (video
+      upload, YOLO processing, pandas aggregation). This export is the
+      bridge between the two: one flat, JSON-safe payload
+      (`schema_version`, camera metadata, hourly vehicle/speed summary,
+      direction totals, per-camera risk context — country/WHO road-death
+      rates, posted speed limit, weather, county crash stats — and the
+      speed-vs-weather table) built by a plain, Streamlit-independent
+      function (`build_export_payload()`, same "no network calls, no
+      Streamlit dependency" shape as `risk_context.py` and
+      `weather_correlation.py`) so it's trivially unit-testable and always
+      matches exactly what's on screen. 7/7 new tests, including a
+      round-trip-through-real-`json.dumps()` check (pandas `Timestamp`/
+      `NaN` values are the usual way this kind of payload silently breaks)
+      and empty-input/zeroed-payload behavior. Next: build the actual
+      display page that reads this file.
+
+- [x] `web/dashboard.html` + `web/src/dashboard-app.js` — a new, polished
+      static dashboard page (dark glass cards + an orange-accented
+      SaaS-analytics look, per the reference designs), hosted free on
+      GitHub Pages alongside the on-device page. Built because Streamlit's
+      own component styling can't produce that look; this page is the
+      "display" half the dashboard export (`dashboard/export.py`) was
+      built to feed.
+      Two halves, deliberately independent of each other:
+      - **Always on, camera-independent** ("Right now"): a live clock and
+        date (no network needed at all), plus the same public, no-key
+        weather/air-quality/road-safety-rate/speed-limit lookups the
+        on-device page's card 3 already does (`context.js`), shown as
+        glass cards. This is the answer to "the dashboard should look
+        relevant even with nothing processed yet" — it's never empty,
+        because it needs no camera or imported data to begin with.
+      - **Traffic analytics**: populated only by importing a JSON file
+        exported from the Streamlit dashboard. Before any import, a
+        deliberate, polished empty state explains this rather than
+        leaving a blank gap. After import: KPI tiles (vehicles tracked,
+        average speed, cameras, county fatal crashes), three Chart.js
+        charts (vehicles/hour, direction split, average speed/hour), and
+        a crash-history/risk-context list — all re-rendered from the same
+        in-memory payload on every language switch.
+      Same language picker as the on-device page (reuses `i18n.js`,
+      with ~25 new keys added to all 4 languages). Chart.js loads from
+      a CDN (same "no build step" pattern as `onnxruntime-web`); if that
+      script fails to load (blocked, offline, ad-blocked), the charts
+      degrade to a plain "not available" line instead of taking down the
+      KPIs/crash-list next to them, which need nothing but the imported
+      JSON — caught two real bugs this way during testing: a
+      temporal-dead-zone crash on page load (same class of bug
+      `web/src/app.js` already had fixed once — `lastPayload` was read
+      inside a function defined above its own `let` declaration), and a
+      chart-fallback element losing its `id` on a second render, which
+      silently broke re-translating the crash list on a language switch
+      after import. Both reproduced and fixed via headless-browser testing
+      (Playwright) with a real sample export file, not just a lint pass.
+      Cross-linked from both other pages: a button on the on-device
+      page's "want deeper analysis" card, and a markdown link under the
+      Streamlit dashboard's title.
+- [x] Renamed the Streamlit app's URL from its random default
+      (`roadtrace-analytics-eznzyjg6jschcteyxmmedl.streamlit.app`) to the
+      much shorter `roadtrace-analytics-d.streamlit.app` (Streamlit's own
+      settings UI — the plain `roadtrace-analytics` subdomain was already
+      taken, hence the `-d` suffix). The GitHub repo name, and so the
+      GitHub Pages URL (`anurodhsingh3862.github.io/RoadTrace-Analytics/`),
+      stayed as-is by choice. Every in-repo link to the old Streamlit URL
+      updated to match.
+- [x] `dashboard/i18n.py` — fixed a real, already-shipped production bug
+      found while doing the above: locale JSON files were loaded once and
+      cached forever, keyed only on language code. Streamlit Community
+      Cloud's ordinary "pull code, rerun the script" deploy path (as
+      opposed to a dependency-change deploy, which does restart the
+      process) never restarts the process, so that cache kept serving
+      whatever a locale file's contents were the *first* time it was ever
+      loaded — a key added in a later deploy (here, `text_try_new_dashboard`
+      from the previous entry) silently rendered as its own literal key
+      name forever, with no error, invisible to every local test (a fresh
+      test process always loads the current file, so the bug only shows up
+      on a long-lived server). Fixed by keying the cache on the file's path
+      *and* mtime, so a redeployed file with new content naturally
+      invalidates the stale entry — no process restart required. Caught by
+      the user from a live screenshot, not by anything in CI; two new
+      regression tests reproduce the exact failure mode (edit a file on
+      disk mid-process, confirm the next lookup sees the change) and the
+      cache's efficiency (an unchanged file isn't reread every call).
+- [x] `web/` camera overlay — fixed a real bug from a live-camera
+      screenshot: labels for small, closely-spaced vehicles near the top of
+      the frame overlapped into unreadable text, and could render partly
+      above the canvas. Labels now shrink and shorten for small boxes, stay
+      clamped inside the canvas, and flip below the box instead of off the
+      top of the frame. (A calibration-reminder banner added alongside this
+      fix was removed again one round later per user feedback — confusing
+      in practice.)
+- [x] `web/` three-page redesign — `index.html` split into a new marketing
+      landing page (hero, 3-step explainer, a clearly-labeled non-live demo
+      card) and `camera.html` (the actual live-camera/upload tool, renamed
+      from the old `index.html`; `src/app.js` renamed to
+      `src/camera-app.js`), and `dashboard.html` restyled with a sidebar
+      nav. All three now share one dark/orange "Pit Lane" design system
+      (`web/theme.css`) adapted from a design mockup the user supplied.
+      Mockup features that don't fit this project were deliberately left
+      out rather than built: license-plate "fastest now" leaderboards and
+      per-vehicle violation alerts (the project collects no identity data
+      — see "Explicitly out of scope" below), a multi-camera strip (the
+      browser tool only ever has one live camera), and pricing/demo-request
+      marketing copy (this is a free portfolio project, not a SaaS
+      product). In their place, the camera page's HUD panels show only
+      data the pipeline already produces: a vehicles-now list by class and
+      speed (no identity), an average-speed sparkline, a flow-rate
+      (vehicles/min) stat, and mean detection confidence. Panels that
+      would overlap the live video on a phone-width screen were placed as
+      cards below the feed instead of floating over it, since this is a
+      phone-first camera tool. Verified end-to-end with Playwright against
+      a locally stubbed `onnxruntime-web` import (this sandbox's network
+      policy blocks the real CDN, same as it always has) — all three pages
+      load with zero console/page errors, language switching re-translates
+      already-rendered content on every page, the dashboard's JSON-import
+      flow renders KPIs/charts/crash list correctly, and the camera page's
+      calibration skip/tap flow and vehicle-list empty state both work.
+
+  - **Removed the on-page calibration/speed-measurement flow from the
+    live camera page.** After the redesign shipped, live testing on real
+    traffic surfaced the two-point "tap to calibrate" card and its
+    "Average speed" HUD panel as confusing/annoying in practice — this
+    was flagged three rounds in a row (speed silently not appearing,
+    then a reminder banner for it, then the calibration card itself).
+    Per explicit feedback, removed the feature entirely from
+    `camera.html`/`camera-app.js` rather than patching the UX further:
+    no more tap-to-calibrate overlay interaction, no distance picker, no
+    advanced pixel-coordinate form, no per-vehicle speed label, no
+    average-speed sparkline. The "Vehicles now" panel now shows a
+    per-class count instead of a per-vehicle speed list, and the HUD's
+    second panel became a simpler "Live stats" card (flow rate +
+    detection confidence only — both already derived without
+    calibration). `web/src/speed.js` (the `Calibration`/`SpeedEstimator`
+    classes) and its test suite are untouched and unused by this page;
+    the Streamlit dashboard (`dashboard/app.py`, which processes
+    pre-recorded video) keeps its own one-time calibration flow, since a
+    single calibration per uploaded video is practical there in a way a
+    live, continuously-changing camera feed is not. Removed ~28 now-dead
+    i18n keys for the old calibration/avg-speed UI across all 4
+    languages and added `hud_stats_title`. Verified with the full test
+    suite (57 unit tests + 12 i18n key-parity tests) and a Playwright
+    smoke test confirming no calibration elements remain, the stats
+    panel renders, and language switching still works.
+
+  - **Added an automatic, uncalibrated speed estimate back to the live
+    camera page.** After removing the manual two-point calibration flow
+    entirely (above), the page had no speed at all — only vehicle
+    counting/classification. Rather than bring back any tap-to-calibrate
+    step, `web/src/speed.js` gained a new `AutoSpeedEstimator`: it scales
+    each vehicle's pixel displacement between frames using a typical
+    real-world width for its detected class (car/truck/bus/motorcycle),
+    no setup required. This is a rough approximation, not a measurement —
+    it assumes the vehicle is roughly broadside to the camera and close
+    to an average size for its class — so it's always shown with an
+    explicit "estimated" label and a one-line disclaimer, never presented
+    as exact. Speed is shown per vehicle class (grouped, not per
+    individual vehicle, keeping the no-identity-data principle), in the
+    "Vehicles now" list, on each overlay label, and as an overall average
+    in the "Live stats" card, with a shared mph/km-h unit toggle that was
+    also missing from the removed flow. 15 new unit tests on
+    `AutoSpeedEstimator` (metersPerPixel scaling, per-class width
+    assumptions, windowing, reset, stale-track pruning) plus a Playwright
+    smoke test confirming the unit toggle, labels, and translations all
+    work. The manual `Calibration`/`SpeedEstimator` classes are untouched
+    and still available if a future calibrated mode is wanted here.
+
+  - **Fixed the actual reason speed never appeared on the live camera
+    page, even after the automatic estimator (above) shipped.**
+    Root cause: `tracker.js`'s `IouTracker` only matched a vehicle to its
+    previous frame by bounding-box overlap (IoU). On a phone, model
+    inference runs far slower than on a desktop (no SIMD/threads in some
+    mobile WASM setups) — easily a couple of frames per second or slower
+    — so a vehicle moving at any real speed can cover more ground between
+    two detection frames than its own box width, leaving zero overlap.
+    The tracker then handed it a brand-new track id every single frame.
+    Classification kept working fine (that's a per-frame judgment, no
+    identity needed) but `AutoSpeedEstimator` needs 2+ samples under the
+    *same* track id, so it silently never got a second sample and speed
+    stayed blank forever — exactly what was reported. Fix: `IouTracker`
+    now also tries a centroid-distance fallback match (same class, center
+    within 2x the box's own size) whenever IoU finds no overlap at all,
+    so a track survives a frame where it moved too far to overlap, while
+    still starting a new track for a genuinely different, far-away
+    vehicle. Added 4 new tracker tests for this exact scenario, plus a
+    dedicated `speed-integration.test.js` that drives the real tracker
+    and the real speed estimator together — simulating a car crossing the
+    frame faster than phone-speed inference keeps up — to catch this
+    specific failure mode if it ever regresses. 70/70 tests passing.
+    Caveat: this is a logic fix verified by simulation and unit tests in
+    this environment (no physical phone camera available here to confirm
+    against); it should be checked against real traffic before relying on
+    it for a professor-facing demo.
+
+  - **Added the posted speed limit to the live camera HUD, next to the
+    estimated vehicle speed.** The "Road safety near you" card already
+    looked this up (OpenStreetMap's nearby `maxspeed` tag) but only on an
+    explicit button press, buried below the fold — easy to miss if you
+    just want to glance at "how fast are vehicles going vs. the limit
+    here" while filming. Now, the moment the live camera starts (not an
+    uploaded file — a video's actual location has nothing to do with
+    wherever the phone requesting the data happens to be), the page asks
+    for location once and shows the posted limit directly in the "Live
+    stats" card, reusing the same lightweight `getNearbySpeedLimit()`
+    lookup and the same shared mph/km-h toggle as the vehicle speed
+    estimate. Degrades honestly: a clear "no data for this road" when
+    OSM has nothing tagged nearby, "location permission denied" if
+    declined, "not available" if the browser has no geolocation support
+    — never a guess. Verified with Playwright against mocked Overpass
+    responses covering all of those cases, plus the live mph/km-h toggle
+    updating the limit in place. The existing "Road safety near you" card
+    (with its fuller World Bank/WHO/weather context) is unchanged.
+
+  - **Diagnosed and partly mitigated inaccurate/missing speeds reported
+    from real on-road testing** (photos from a handheld phone walking
+    alongside a road). Root cause is a fundamental limitation of this
+    method, not a bug: `AutoSpeedEstimator` assumes the *camera* is still
+    and only the vehicle moves, converting pixel displacement to
+    real-world speed from that one assumption. A handheld, walking,
+    panning phone violates it — every detection (including a parked car)
+    picks up spurious apparent motion from the camera's own movement, and
+    a steep/oblique viewing angle down the road (rather than broadside to
+    it) makes the pixel-to-meter conversion unreliable for vehicles moving
+    mostly toward/away from the camera rather than across it. This is the
+    same monocular-vision limitation any uncalibrated camera-based speed
+    system has; true accuracy needs either a fixed, perpendicular camera
+    or a real calibration reference (which is exactly why `core/`'s
+    design and the original repo's intended workflow are a stationary or
+    vehicle-mounted camera filming traffic, not a pedestrian walking with
+    a phone). Two concrete, additive mitigations shipped, neither changing
+    the existing auto/no-calibration behavior on a device that doesn't
+    need them:
+    - `web/src/motion.js` (`ShakeDetector`, new): uses the phone's
+      accelerometer (`devicemotion`) as a cheap proxy for "is the camera
+      being held still right now?" and gates `AutoSpeedEstimator` —
+      speed sampling pauses (shown via a "camera is moving" notice) while
+      the phone is being panned/walked, resuming once it steadies,
+      without resetting a vehicle's existing smoothing window. Devices
+      without a motion sensor, or where permission is denied, simply
+      never engage the gate (fail-open — identical to prior behavior).
+    - `AutoSpeedEstimator` now has a small noise floor (2.5 mph default):
+      an apparent speed below it is reported as 0 rather than a
+      small-but-wrong number, since ordinary detection-box jitter alone
+      produces a couple of mph of noise — showing "2 mph" on a parked car
+      was that noise floor being displayed with false precision, not a
+      measurement.
+    - Added an on-screen tip recommending the phone be held steady (or
+      rested on something) and faced across the road rather than down it.
+    - 10 new tests (`motion.test.js` + `speed.test.js` additions), 89/89
+      passing. **Not fixed, and not fixable without a different capture
+      setup**: estimating speed accurately from a handheld phone looking
+      down the length of a road is an inherently hard monocular-vision
+      problem. For a meaningfully more accurate reading, record with the
+      phone mounted/resting still and roughly perpendicular to traffic
+      flow (the "Upload a video" path works well for this) rather than
+      filming live while walking.
+
+  - **Fixed a real sizing bug that was understating speed by roughly
+    2-3x for broadside traffic** (a car crossing the frame side-on, the
+    most common framing). `AutoSpeedEstimator` converts a detection box's
+    pixel width to a real-world distance using an assumed vehicle size —
+    but a box's pixel *width* means different things depending on viewing
+    angle: head-on/rear-on, it spans the vehicle's actual width (~1.8m
+    for a car); broadside, it spans nose-to-tail, i.e. the vehicle's
+    *length* (~4.5m). The code was always using the width constant,
+    which is correct for head-on traffic but badly understates distance
+    (and therefore speed) for the broadside case — exactly what real
+    street photos showed (cars visibly doing city-street speeds reading
+    as 3-8 mph). Also worth stating plainly: phone GPS can't fix this —
+    it reports the *phone's* speed, not a third-party vehicle's, so it's
+    only useful for where the phone is (which is what the posted-speed-
+    limit lookup already uses it for), not for timing traffic. Fixed by
+    adding a width-to-height aspect-ratio check: a wide, short box is now
+    read as broadside and scaled by an assumed vehicle *length*
+    (`AVG_VEHICLE_LENGTH_M`); a taller/squarer box is scaled by width as
+    before. Backward compatible — `AutoSpeedEstimator.update()`'s new
+    `heightPx` parameter is optional and trailing, so omitting it
+    reproduces the old (width-only) behavior exactly. 3 new tests, 82/82
+    passing. Still an approximation — a 3/4-angle vehicle isn't fully
+    either case, and the underlying handheld-camera/viewing-angle
+    limitations above still apply — but this removes what was the single
+    largest source of error in the numbers reported from real testing.
+
+  - **Moved the posted speed limit and the mph/km-h toggle onto the live
+    camera view itself**, instead of only in the "Live stats" card below
+    the video — field testing showed both were easy to miss without
+    scrolling down while actively filming. Both now also appear as a
+    chip directly over the camera feed, next to the live clock, kept in
+    sync with the card version from the same underlying state.
+  - **Added a speed-vs-posted-limit comparison**, shown next to both the
+    per-vehicle-class speed in the vehicle list and the overall average
+    speed stat: "N% below the speed limit" in green, "N% above the speed
+    limit" in red, or "At the speed limit" when they match. Computed only
+    once a posted limit has actually resolved for the session (never a
+    guess against a placeholder).
+  - **On "can we use local aerial sensors / anything else for more
+    accuracy"**: no — there's no zero-cost way to add an external speed
+    sensor (radar, LIDAR, drone/aerial imagery) without reintroducing
+    real cost or hardware dependencies, which would defeat the point of
+    this project. The only zero-cost path to materially better accuracy
+    is geometric: a real camera calibration (perspective/homography from
+    known road geometry) rather than the current per-class assumed-size
+    heuristic — tracked as a planned item below. The most useful thing a
+    tester can do right now is an informal ground-truth check: have a
+    second person drive past at a known, steady speed (read off their
+    own speedometer) and compare it to what the HUD reports.
+
+- [x] `web/src/calibration.js` — **automatic monocular perspective
+  calibration from lane geometry**, the real alternative promised above
+  (as opposed to another heuristic). A few seconds after the camera (or
+  an uploaded clip) starts, a downscaled frame is run through a small
+  Sobel edge filter and a custom Hough-style vote (parameterized as
+  `x = m*y + b` to stay stable near-vertical, unlike the usual `y = mx+b`)
+  to find two converging lane-boundary lines. Their intersection is the
+  vanishing point; implausible pairs (lines that don't actually converge
+  above the scanned road region) are rejected rather than calibrated
+  against. Given the two line equations, the pixel gap between them at
+  any image row IS that row's real lane width in pixels — dividing an
+  assumed standard lane width (3.7m) by it gives a real, perspective-
+  correct meters-per-pixel scale at that row, with no further
+  assumptions. `speed.js`'s `AutoSpeedEstimator` takes this as an
+  optional `metersPerPixelOverride` and uses it instead of the per-class
+  vehicle-size guess whenever it's available, falling back to that
+  heuristic automatically whenever no confident lane geometry is found
+  (unmarked roads, occluded markings, poor lighting) — nothing about the
+  existing behavior changes for a session where calibration doesn't
+  succeed. Retries on a 3-second timer, up to 6 attempts, then gives up
+  quietly. A HUD chip on the camera view ("Calibrated from lane
+  geometry" vs. "Estimated from vehicle size") shows which mode is
+  active, in all 4 supported languages.
+  **Honest scope note, stated in the module and worth repeating here**:
+  this is mathematically rigorous for motion ACROSS the lane direction
+  (the dominant case for broadside traffic — also the case the
+  orientation-aware sizing fix above already favors), not for motion
+  straight toward/away from the camera (depth). A fully depth-accurate
+  scale would need one more independent assumption this method
+  deliberately doesn't make — camera height or focal length/field of
+  view, neither of which is recoverable from lane geometry alone on an
+  arbitrary handheld or dashboard-mounted phone. The scale this module
+  derives is applied to the full 2D pixel displacement as the best
+  available approximation: exact for lateral motion, approximate for
+  depth motion — same trade-off every genuinely zero-input monocular
+  method makes, just now backed by real scene geometry instead of a
+  population-average vehicle size. 9 new tests (`calibration.js`'s own
+  7 plus 2 covering the `metersPerPixelOverride` wiring in
+  `speed.test.js`), 91/91 passing.
+  - **Performance fix, same day**: the line-vote step (`houghLaneLines`)
+    originally used a `Map` per slope bucket and recomputed `slope*y` on
+    every single pixel. Benchmarked against a busy/noisy synthetic frame
+    (lots of edges — gravel, foliage, other traffic, not just the two lane
+    lines) this cost 500-660ms of main-thread time per calibration attempt,
+    enough to visibly freeze the live camera view each time it retried.
+    Replaced the `Map`s with flat `Int32Array` vote accumulators (no
+    hashing/boxing) and hoisted the per-bucket `slope*y` term out of the
+    pixel loop into the row loop (it's constant across a row) — same
+    arithmetic, ~10x faster: the same worst-case benchmark now runs in
+    ~55ms, and a more realistic road-texture frame in ~10-40ms. All 91
+    tests still pass unchanged; this was a pure performance fix, not a
+    behavior change.
+
+- [x] Two small, independent accuracy/robustness fixes from a second
+  accuracy-focused review pass:
+  - **`web/src/camera-app.js` now drives detection off
+    `HTMLVideoElement.requestVideoFrameCallback()`** (with an automatic
+    `requestAnimationFrame` fallback on browsers that don't support it yet)
+    instead of plain `requestAnimationFrame`. rAF fires on every display
+    repaint even when the video hasn't actually produced a new frame —
+    a slower camera feed, a throttled tab, or a display refreshing faster
+    than the source decodes all mean wasted detector passes re-processing
+    the same pixels. The timestamp fed to the speed estimator is now the
+    video element's own presentation clock (`metadata.mediaTime`) rather
+    than wall-clock time, so it tracks actual frame delivery. Also fixed a
+    latent (minor, never previously triggered since the page didn't
+    support switching sources mid-timer-baseline) bug this change would
+    have made worse: switching from the camera to an uploaded file (or
+    back) now resets the elapsed-time baseline, since each source has its
+    own independent media clock starting at 0.
+  - **`web/src/roi.js` (new)**: excludes the outer ~15% of the frame
+    (each side) from speed *scoring* — vehicles there are still detected
+    and boxed, just not given a speed estimate for that frame. This is the
+    one well-understood, assumption-free fix for lens distortion: a phone
+    camera's radial (barrel/pincushion) distortion is worst at the frame
+    edges and least near the center, and a vehicle spends very little of
+    its time on screen in that margin anyway. Deliberately not the
+    alternative considered (asking the user to pick "standard" vs.
+    "ultra-wide" lens and applying a radial-undistortion coefficient) —
+    that would reintroduce exactly the kind of manual setup step this page
+    removed once already (see the top-of-file note in `camera-app.js`
+    about why tap-to-calibrate was taken out).
+  - 6 new tests (`roi.test.js`), 97/97 passing.
+
+- [x] `web/src/tilt.js` (new) — **camera-tilt guidance**, the highest-value
+  item from that same review: catches the single worst real-world accuracy
+  problem (a badly-angled phone) before any math has to compensate for it,
+  using the phone's own orientation sensor (`DeviceOrientationEvent`) —
+  zero cost, no new permission beyond what the shake-detection feature
+  already asks for.
+  - A HUD chip reads "Camera level" or "Camera tilted ~N° — hold more
+    upright", and a virtual-horizon line is drawn over the camera view
+    (rotates to counter the phone's left-right bank, like a bubble level or
+    an aircraft attitude indicator), with a fixed crosshair at center for
+    reference.
+  - **Honestly scoped, same spirit as `calibration.js`**: only evaluates
+    tilt in PORTRAIT orientation — landscape swaps which raw sensor axis
+    means pitch vs. roll in a way that needs verification against a real
+    device this project can't do from a cloud dev sandbox, so landscape
+    reports "unknown" and shows nothing rather than risk backwards
+    guidance. Pitch (forward/back tilt) is reported as a magnitude only,
+    not a signed "tilt up" vs. "tilt down" direction, for the same
+    real-device-verification reason. Roll (left-right bank) doesn't have
+    that ambiguity and IS signed, which is what drives the horizon-line
+    overlay's rotation direction.
+  - Fails open exactly like the shake detector: no orientation sensor, or
+    permission denied, and the chip simply never appears — nothing breaks.
+  - 15 new tests (`tilt.test.js`), 112/112 passing. **Not yet
+    field-verified against a real phone's actual sensor sign conventions
+    in both portrait orientations (upright vs. upside-down)** — the pure
+    angle math is tested, but the real-device check is still open.
+
+- [x] `web/src/confidence.js` (new) — **a per-vehicle measurement-confidence
+  rating**, built entirely from signals already computed elsewhere on this
+  page (camera steadiness, tilt status, whether this specific speed used
+  geometric calibration vs. the size heuristic, and how many consecutive
+  samples the vehicle's track has accumulated) — nothing new is measured
+  just to produce this. The point is reporting honestly how much to trust a
+  given reading rather than presenting every number with the same confident
+  label regardless of how shaky its inputs were.
+  - Scored conservatively: an unsteady camera or a too-short tracklet (under
+    8 samples) floors the rating at "low" outright, since there's barely a
+    real measurement yet; otherwise it starts "high" and drops one level
+    per secondary issue (camera tilted, or using the heuristic scale
+    instead of geometric calibration). An "unknown" tilt reading (no
+    sensor, or landscape — see `tilt.js`) is NOT penalized, since
+    confidence should reflect what's actually known to be wrong, not what
+    couldn't be checked.
+  - Surfaced as a single HUD chip ("Measurement confidence: High/Medium/
+    Low") reporting the WORST level among currently-visible vehicles, not
+    an average — understating trust is the safe direction to be wrong in
+    for a measurement-confidence indicator.
+  - `AutoSpeedEstimator` gained a small `getSampleCount(trackId)` accessor
+    (speed.js) to expose the tracklet-length signal without duplicating
+    bookkeeping that already exists internally.
+  - 11 new tests (8 in `confidence.test.js`, 3 covering `getSampleCount` in
+    `speed.test.js`), 123/123 passing.
+
+- [x] **ByteTrack-style low-confidence box retention** in `web/src/tracker.js`
+  — borrows the single most load-bearing idea from ByteTrack (the real
+  tracker this project's `IouTracker` deliberately isn't a full port of)
+  without needing a Python runtime: a SECOND matching pass, after the
+  normal one, against detections that scored below the display confidence
+  threshold and would otherwise be thrown away before ever reaching the
+  tracker. A vehicle that's briefly, partially occluded (another car
+  passing in front of it, a moment of motion blur) often still produces a
+  detection box — just a low-scoring one. Previously that meant the track
+  went quiet for that frame with no position update at all; now it can be
+  extended through the gap.
+  - The key asymmetry that keeps this safe: a low-confidence detection can
+    only EXTEND a track the normal pass failed to match — it can never
+    start a brand-new one. A noisy, low-confidence box can confirm "the
+    vehicle that was already here is still here," never invent a vehicle
+    that was never confidently seen in the first place.
+  - `web/src/postprocess.js` gained `postprocessTiered()`, decoding once at
+    a lower threshold and running NMS over the combined pool before
+    splitting by score (rather than two independent NMS passes that could
+    disagree with each other at the tier boundary). `web/src/detector.js`
+    gained a matching `detectTiered()`, sharing the actual inference call
+    with the existing `detect()` and differing only in postprocessing.
+    `tracker.js`'s `update()` keeps its original one-argument signature
+    working exactly as before — the low-confidence array is a new, optional
+    second argument.
+  - A box drawn from a low-confidence match gets a dashed outline on the
+    camera view instead of a solid one — same transparency instinct as
+    every other honesty label on this page: the vehicle doesn't just
+    disappear, but a lower-quality frame is visibly marked as one.
+  - 8 new tests (5 in `tracker.test.js`, 3 in `postprocess.test.js`,
+    covering the tiering logic and the exact-match guarantee against
+    `postprocess()`'s existing behavior), 131/131 passing. `detector.js`
+    itself still isn't unit-testable here (needs a real ONNX runtime) —
+    verify `detectTiered()` by running it in a browser.
+
+- [x] `web/src/depth-calibration.js` (new) — **depth-axis (toward/away from
+  camera) geometric calibration**, closing the one gap `calibration.js`'s
+  own scope note flags: that module gives a rigorous pixel-to-meter scale
+  for motion ACROSS the lane, but only an approximation for motion straight
+  toward/away from the camera, since that needs one more independently-known
+  real-world length that lane geometry alone can't supply. This module
+  supplies it — not via camera height or focal length (the assumption the
+  prior review's write-up incorrectly claimed was required), but via a
+  standard painted dashed-lane-marking cycle, combined with the vanishing
+  point `calibration.js` already detects, using a classic single-view-
+  metrology result: for points receding along a straight line toward a
+  vanishing point, real depth `Z(y) = C / (y - vpY)`, where `C` is a single
+  constant solvable from any one already-known real-world distance between
+  two rows on that line.
+  - **Method**: samples brightness along a detected lane line from the
+    vanishing point outward, finds the rows where it rises from dark
+    pavement to a bright painted stripe (the leading edge of each dash —
+    consecutive edges are, by definition, exactly one dash cycle apart in
+    the real world), and solves for `C` from each consecutive pair, using
+    the median across all pairs as the final, outlier-resistant estimate.
+  - **Honestly scoped**: the one assumption this adds is a standard US
+    MUTCD dashed-lane-line cycle (10ft stripe + 30ft gap, ~12.19m) — the
+    same category of regionally-typical default as `calibration.js`'s 3.7m
+    lane width, not a universal constant; urban and local roads often use
+    shorter cycles. Models distance along the detected lane line's
+    direction, which stands in for true forward depth only when the camera
+    is reasonably aligned with the road — the same assumption every
+    vanishing-point method here already makes. Silently returns null
+    whenever a confident dash pattern can't be found (a solid line, faded
+    paint, a non-standard cycle length, poor lighting), exactly like every
+    other calibration path on this page — callers fall back to the
+    existing lateral-only approximation as if this module weren't there.
+  - **Wiring** (`camera-app.js`, `speed.js`): attempted once per captured
+    calibration frame, right alongside the existing lane-geometry attempt,
+    reusing the same frame and detected geometry rather than a second
+    capture/detection pass. `AutoSpeedEstimator.update()` (speed.js) gained
+    a new, optional, trailing `depthCalibration` parameter: when both points
+    in a pair carry it AND a `metersPerPixelOverride`, displacement is
+    decomposed into its lateral component (scaled by the existing lateral
+    meters-per-pixel) and its depth component (this module's real
+    `depthMetersBetweenRows` distance), combined via `Math.hypot` for an
+    actual 2D ground-plane measurement — rather than applying one scale to
+    the raw pixel distance as calibration.js's own scope note says is only
+    an approximation for depth motion. Omitted or null (no confident dash
+    pattern found), behavior is unchanged.
+  - 14 new tests (`depth-calibration.test.js`) plus 4 more in `speed.test.js`
+    covering the decomposition/fallback logic, 149/149 passing. **Not yet
+    field-verified against a real painted dashed lane line** — the
+    synthetic-raster tests check the math is right, but real paint, real
+    lighting, and real dash-cycle variation are still open until tested
+    against actual road footage.
+
+## Planned, in order
+1. **A road-level crash dataset** — the actual remaining prerequisite for
+   `risk_context.py` to become a real risk model instead of "measured
+   facts side by side". FARS/county data is the ceiling for what a
+   free, no-key US source gives; a road-specific one (e.g. a state DOT's
+   open crash-location dataset) would need its own adapter, one state at
+   a time, same pattern as everything in `data_layers/`.
+2. **Remaining global/regional data-layer sources** — UN regional
+   indicators, ITF/OECD reports, iRAP star ratings, following the same
+   pattern as `data_layers/`.
+3. **Permanent free URL for the on-device/dashboard pages** — register a
+   free is-a.dev subdomain (`roadtrace-analytics.is-a.dev`) pointing at the
+   GitHub Pages deployment. The automated fork/PR routes are blocked for
+   this environment (can't fork/PR a third-party GitHub repo via API), so
+   the user forked and opened the PR manually: `is-a-dev/register#55217`.
+   Template and CI checks are green as of this writing; it's now waiting
+   on a volunteer maintainer's code-owner review, which this project has
+   no control over. Once merged: add a `CNAME` file
+   (`roadtrace-analytics.is-a.dev`) to the `gh-pages` branch and update
+   every in-repo link from the GitHub Pages URL. Until then, the GitHub
+   Pages URL (`anurodhsingh3862.github.io/RoadTrace-Analytics/`) is the
+   one in active use.
+
+## Explicitly out of scope
+- No license plate recognition, vehicle registration lookup, or any
+  identity/criminal-record data. See the project discussion for why.
+- No native mobile app (App Store/Play Store accounts cost money; PWA
+  covers the "install on your phone" requirement at zero cost).
