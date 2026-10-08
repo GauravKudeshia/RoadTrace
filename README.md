@@ -26,6 +26,26 @@ Each run saves an annotated video, a trajectory CSV, and a speed histogram. Coun
 
 The detection and tracking methods come from existing libraries. The work here is connecting them to road calibration, handling missing or unreliable speed measurements, and making the results inspectable.
 
+## RoadTrace Analytics — mobile and dashboard extensions
+
+The newer application adds a mobile-browser traffic-observation interface, a multi-video dashboard, public road-safety data adapters and a packaged Python pipeline. **The original project and the saved demonstration in this repository are preserved.**
+
+**[Live browser app](https://roadtrace-analytics.netlify.app/)** · [Streamlit dashboard](https://roadtrace-analytics-d.streamlit.app/) · [Project guide](docs/PROJECT_GUIDE.md) · [Browser setup](web/README.md) · [Validation](docs/VALIDATION.md)
+
+| Workflow | Location | How to run |
+| --- | --- | --- |
+| Original video pipeline | Root folder | `python run_sample.py` |
+| Packaged pipeline | `core/` | `python -m core.app --video your_video.mp4` |
+| Streamlit dashboard | `dashboard/` | Install `requirements-analytics.txt`, then `streamlit run dashboard/app.py` |
+| Browser-based detection and speed estimates | `web/` | Follow `web/README.md` for ONNX export, then serve locally |
+| Public data context | `data_layers/` | Used by the dashboard when location information is available |
+
+**Documented sample:** 24 core tests reported passing; 200 frames, 14 tracked software IDs, 803 trajectory observations and 461 numeric speed observations in an eight-second source clip. These are **software outputs, not verified roadside speed or count accuracy**.
+
+The browser uses on-device inference with automatic approximate scale cues; the calibrated Python workflow is separate. The browser may contact external APIs for weather and road context, and the hosted Streamlit dashboard runs server-side. Field accuracy remains to be independently verified.
+
+The new material was adapted from [RoadTrace-Analytics](https://github.com/anurodhsingh3862/RoadTrace-Analytics). [Source attribution and licensing notice](ATTRIBUTION.md) applies; importing the code does not resolve its open licensing question.
+
 ## Run it locally
 
 Use Python 3.10 or newer. Clone or download this repository, open a terminal in its folder, then run:

@@ -1,0 +1,19 @@
+{
+  "name": "RoadTrace Analytics",
+  "short_name": "RoadTrace",
+  "description": "Counts vehicles and estimates speed from any camera, entirely on your own device. No upload, no server.",
+  "start_url": "./camera.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0b0b0d",
+  "theme_color": "#0b0b0d",
+  "orientation": "any",
+  "icons": [
+    {
+      "src": "icons/roadtrace-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
